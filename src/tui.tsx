@@ -47,7 +47,30 @@ export default Plugin.define({
     })
     controller.start()
     // A reconnect may have missed state events; re-query the authoritative state.
-    const stopConnected = ctx.data.on("server.connected", () => void controller.refresh())
+    // The TUI client uses the authenticated HTTP API. Unlike the server plugin
+    // adapter in 2.2.5, this path applies the archived field.
+    const archiveReviewer = async (sessionID: string): Promise<void> => {
+      try {
+        const session = await ctx.client.session.get({ sessionID })
+        if (disposed || session.metadata?.["opencode-auto-review"] !== true || session.time.archived) return
+        await ctx.client.session.update({ sessionID, archived: true })
+      } catch {
+        if (!disposed) toast("Could not archive an auto-review session. It remains marked [Auto-review].")
+      }
+    }
+    const archiveExisting = () => {
+      for (const session of ctx.data.session.list()) {
+        if (session.metadata?.["opencode-auto-review"] === true && !session.time.archived) void archiveReviewer(session.id)
+      }
+    }
+    const stopCreated = ctx.data.on("session.created", (event) => {
+      if (!disposed && isLocal(event.location)) void archiveReviewer(event.data.sessionID)
+    })
+    archiveExisting()
+    const stopConnected = ctx.data.on("server.connected", () => {
+      void controller.refresh()
+      archiveExisting()
+    })
 
     // A keymap layer is owned by the calling Solid component. `setup` runs
     // outside the keymap provider tree, so registering here would throw
@@ -73,7 +96,7 @@ export default Plugin.define({
             const action = await ctx.ui.dialog.select({
               title: "Auto-review mode",
               options: [
-                { title: "Enable", value: "on", description: "Review eligible requests; ask when evidence or confirmation is needed" },
+                { title: "Enable", value: "on", description: "Automatically review permission requests" },
                 { title: "Disable", value: "off", description: "Use normal OpenCode permission handling" },
                 { title: "Human fallback", value: "fallback", description: "When off, a decision needing a human is denied instead of prompting, so unattended work cannot stall" },
                 { title: "Show status", value: "status" },
@@ -119,7 +142,7 @@ export default Plugin.define({
 
       return (
         <Show when={enabled() && props.mode === "normal"}>
-          <text fg={ctx.theme.text.action.primary.default}>
+          <text fg={ctx.theme.text.action.primary.base}>
             <b>Auto Mode</b>
           </text>
         </Show>
@@ -134,6 +157,7 @@ export default Plugin.define({
     return () => {
       disposed = true
       stopConnected()
+      stopCreated()
       stopNotices()
       controller.dispose()
       removeStatus()

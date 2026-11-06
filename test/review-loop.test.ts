@@ -35,6 +35,22 @@ async function run(responses: string[], source = messages, maxInputTokens = 16_0
   return { result, calls, prompts }
 }
 
+test("completed sibling results are retrievable while pending and later results stay hidden", async () => {
+  const source = [
+    { type: "user", text: "Run exactly once" },
+    { type: "assistant", id: "current", content: [
+      { type: "tool", id: "first", name: "shell", state: { status: "completed", input: { command: "charge 100" }, content: [{ type: "text", text: "charged" }] } },
+      { type: "tool", id: "pending", name: "shell", state: { status: "running", input: { command: "charge 100" } } },
+    ] },
+    { type: "assistant", id: "future", content: [{ type: "tool", id: "later", name: "shell", state: { status: "completed", input: {}, content: [] } }] },
+  ]
+  const evidence = captureEvidence(source, event)
+  assert.deepEqual(evidence.index.tools, [{ messageID: "current", toolID: "first", name: "shell" }])
+  const result = await evidence.read({ type: "tool_result", messageID: "current", toolID: "first", offset: 0 }) as { text: string }
+  assert.match(result.text, /charged/)
+  assert.deepEqual(await evidence.read({ type: "tool_result", messageID: "future", toolID: "later", offset: 0 }), { error: "No completed result in the captured parent history" })
+})
+
 test("repeated evidence requests terminate rather than spin", async () => {
   const { result, calls } = await run([investigate, investigate])
   assert.equal(result.code, "stalled")
@@ -168,6 +184,23 @@ test("recovering omitted original user messages can support automatic approval",
   })
   assert.equal(result.decision?.decision, "allow")
   assert.equal(calls, 2)
+})
+
+test("old history offsets cannot disclose a new restriction in the current snapshot", async () => {
+  const current = [
+    { type: "user", text: "New restriction: do not deploy" },
+    ...messages,
+  ]
+  const stale = JSON.stringify({ type: "evidence", request: { type: "history", offset: 0 }, result: { entries: [{ type: "user", text: "Test the project" }] } })
+  const common = { lines: [stale], evidence: captureEvidence(current, event), options, maxInputTokens: 16_000,
+    signal: new AbortController().signal, deadline: Date.now() + options.timeoutMs }
+  const rejected = await runReviewLoop({ ...common, generate: async () => ({ text: JSON.stringify({ decision: "allow", risk: "low", authorization: "high", matched_rules: [] }), timedOut: false }) })
+  assert.equal(rejected.code, "incomplete_authorization")
+  let round = 0
+  const recovered = await runReviewLoop({ ...common, generate: async () => ({ text: round++ === 0
+    ? JSON.stringify({ decision: "investigate", reason: "Read current user restrictions", requests: [{ type: "history", offset: 0 }] })
+    : JSON.stringify({ decision: "allow", risk: "low", authorization: "high", matched_rules: [] }), timedOut: false }) })
+  assert.equal(recovered.code, "allow")
 })
 
 test("one deadline includes preparation and every model round", async (t) => {

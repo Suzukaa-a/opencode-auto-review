@@ -31,6 +31,7 @@ export async function runReviewLoop(input: {
   signal: AbortSignal
   deadline: number
   generate: (prompt: string, timeoutMs: number) => Promise<StageResult>
+  onJournal?: (lines: readonly string[]) => void
   onRound?: (round: number, outcome: string) => void
 }): Promise<ReviewOutcome & { lines: string[] }> {
   const { options, signal } = input
@@ -64,6 +65,8 @@ export async function runReviewLoop(input: {
     }
     const remaining = deadline - Date.now()
     if (remaining <= 0) return unavailable("timeout", "Automatic review reached its deadline")
+    // Capture the exact send before waiting: cancellation cannot erase it.
+    input.onJournal?.(lines)
     const result = await input.generate(prompt, remaining)
     if (signal.aborted) return unavailable("aborted", "Automatic review was cancelled")
     if (Date.now() >= deadline) return unavailable("timeout", "Automatic review reached its deadline")

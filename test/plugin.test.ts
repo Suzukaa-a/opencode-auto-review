@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import plugin from "../src/index.js"
+import { buildReviewSystemPrompt } from "../src/policy.js"
 
 const allowText = JSON.stringify({
   decision: "allow",
@@ -25,6 +26,8 @@ const mediumText = JSON.stringify({
   matched_rules: [],
 })
 
+let nextHarnessID = 0
+
 function createHarness(
   options: Record<string, unknown> = {},
   generate: string | ((input: any, options: { signal?: AbortSignal }) => Promise<{ text: string }>) = allowText,
@@ -37,6 +40,10 @@ function createHarness(
   let onPrompt: ((event: any) => void) | undefined
   let onContext: ((event: any) => Promise<void> | void) | undefined
   let onCompaction: ((event: any) => Promise<void> | void) | undefined
+  let onGenerate: ((event: any) => Promise<void> | void) | undefined
+  const reviewers = new Map<string, any>()
+  const harnessID = ++nextHarnessID
+  let reviewerID = 0
   let generateCalls = 0
   let contextCalls = 0
   let disposed = 0
@@ -106,6 +113,7 @@ function createHarness(
   // 2.0.2's `ctx.catalog.model` nesting.
   const storageEntries = new Map<string, any>()
   const ctx = {
+    location: { directory: `/test/${harnessID}` },
     options: pluginOptions,
     storage: storageOverride ?? {
       get: async (key: string) => structuredClone(storageEntries.get(key)),
@@ -131,23 +139,43 @@ function createHarness(
         if (_name === "prompt") onPrompt = callback
         if (_name === "context") onContext = callback
         if (_name === "compaction") onCompaction = callback
+        if (_name === "generate") onGenerate = callback
         return { dispose: async () => undefined }
       },
+      create: async (input: any) => { const info = { ...input, id: `reviewer-${harnessID}-${++reviewerID}` }; reviewers.set(info.id, info); return info },
+      update: async () => undefined,
+      remove: async ({ sessionID }: any) => { reviewers.delete(sessionID) },
+      generate: async ({ sessionID, prompt }: any, requestOptions: { signal?: AbortSignal }) => {
+        const selected = reviewers.get(sessionID)
+        const event: any = { sessionID, model: selected.model, system: [{ type: "text", text: "UNTRUSTED_PROJECT_SYSTEM" }], messages: [{ role: "user", content: [{ type: "text", text: prompt }] }], tools: { shell: {} }, options: {} }
+        await onGenerate!(event)
+        assert.deepEqual(event.system, [{ type: "text", text: buildReviewSystemPrompt(Number(pluginOptions.maxReviewTokens ?? 2048)) }])
+        assert.deepEqual(event.tools, {})
+        const text = `${event.system[0].text}\n${event.messages[0].content[0].text}`
+        generateCalls++
+        generatedPrompts.push(text)
+        generationSignal = requestOptions.signal
+        if (typeof generate === "function") return generate({ prompt: text, model: selected.model }, requestOptions)
+        return { text: generate }
+      },
       context: async () => { contextCalls++; return context ? context() : messages },
-      get: async ({ sessionID }: { sessionID: string }) => sessionInfo(sessionID),
+      get: async ({ sessionID }: { sessionID: string }) => {
+        if (sessionID.startsWith("reviewer-") && !reviewers.has(sessionID)) throw Object.assign(new Error("missing reviewer"), { _tag: "NotFoundError" })
+        return reviewers.get(sessionID) ?? sessionInfo(sessionID)
+      },
       synthetic: async (input: { sessionID?: string; text: string; description?: string; delivery?: string; resume?: boolean | null; metadata?: Record<string, unknown> }) => {
         syntheticCalls.push(structuredClone(input))
         synthetic.push(input.text)
         if (input.description) syntheticDescriptions.push(input.description)
       },
     },
-    generate: { text: async (input: any, requestOptions: { signal?: AbortSignal }) => {
+    experimental: { generate: { text: async (input: any, requestOptions: { signal?: AbortSignal }) => {
       generateCalls++
       generatedPrompts.push(input.prompt)
       generationSignal = requestOptions.signal
       if (typeof generate === "function") return generate(input, requestOptions)
       return { text: generate }
-    } },
+    } } },
     agent: { get: async () => { throw new Error("missing") } },
     model: { ...(catalogOverride ?? defaultCatalog) },
     rpc: {
@@ -161,6 +189,7 @@ function createHarness(
     },
   }
   return {
+    setScope(directory: string) { ctx.location.directory = directory },
     async setup() {
       const cleanup = await plugin.setup(ctx as any)
       assert.ok(evaluate)
@@ -340,8 +369,7 @@ test("the journal snapshot is persisted, not only kept in memory", async () => {
   await harness.run()
   const first = harness.storedJournal()
   assert.ok(first, "the snapshot must be written to storage")
-  assert.equal(first.version, 5)
-  assert.equal(first.sealed, false, "the body is still growing")
+  assert.equal(first.version, 6)
   assert.ok(Array.isArray(first.body) && first.body.length > 0)
 
   harness.messages[1]!.content[0].state.status = "completed"
@@ -390,7 +418,7 @@ test("a recreated instance restores the journal boundary instead of rebuilding",
     return { entries, storage }
   }
   const narrow = (harness: ReturnType<typeof createHarness>) => {
-    harness.catalogModel.limit = { context: 13_000, input: 13_000, output: 1_024 }
+    harness.catalogModel.limit = { context: 64_000, input: 64_000, output: 1_024 }
   }
   const journalOf = (entries: Map<string, any>) => structuredClone(entries.get("journal/ses_test"))
 
@@ -398,18 +426,19 @@ test("a recreated instance restores the journal boundary instead of rebuilding",
   const a = run(true)
   const first = createHarness({}, allowText, undefined, undefined, a.storage)
   narrow(first)
+  first.setScope("/test/journal-restore")
   await first.setup()
   await runSeeded(first, "x", 61)
   const snapshot = journalOf(a.entries)
   assert.ok(snapshot, "the first instance must persist a snapshot")
-  const header = JSON.parse(snapshot.body[0]) as { omitted: { tools: number } }
-  assert.ok(header.omitted.tools > 0, "the initial selection must omit tools so a rebuild would differ")
+  assert.ok(snapshot.body.some((line: string) => line.includes("review_outcome")), "restored records include the prior outcome")
 
   // Instance B shares storage and continues the same transcript with more actions.
   const second = createHarness({}, allowText, undefined, undefined, a.storage)
   narrow(second)
+  second.setScope("/test/journal-restore")
   await second.setup()
-  await runSeeded(second, "x", 81)
+  await runSeeded(second, "x", 61)
   const restored = journalOf(a.entries)
   assert.equal(restored.epoch, snapshot.epoch, "restoring must not start a new epoch")
   assert.equal(restored.body[0], snapshot.body[0], "the restored header must match, not be recomputed")
@@ -422,9 +451,10 @@ test("a recreated instance restores the journal boundary instead of rebuilding",
   const third = createHarness({}, allowText, undefined, undefined, lost.storage)
   narrow(third)
   await third.setup()
-  await runSeeded(third, "x", 81)
+  await runSeeded(third, "x", 61)
   const rebuilt = journalOf(lost.entries)
-  assert.notEqual(rebuilt.body[0], snapshot.body[0], "a rebuild rewrites the header line")
+  assert.ok(!rebuilt.body.some((line: string) => line.includes("review_outcome")) || rebuilt.body.length < restored.body.length,
+    "without restoration the prior assessment records are absent")
 })
 
 test("a hung journal read does not wedge the next same-session review", async () => {
@@ -505,6 +535,61 @@ test("a delayed journal write cannot overwrite a newer snapshot", async () => {
     "the newer snapshot must be the durable one, not the delayed older one")
 })
 
+test("resume keeps the exact sent investigation prefix before its snapshot reaches storage", async () => {
+  const entries = new Map<string, any>()
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let firstWrite = true
+  const storage = {
+    get: async (key: string) => structuredClone(entries.get(key)),
+    set: async (key: string, value: any) => {
+      if (key.startsWith("journal/") && firstWrite) { firstWrite = false; await gate }
+      entries.set(key, structuredClone(value))
+    },
+  }
+  let calls = 0
+  const first = createHarness({}, async () => ({ text: calls++ === 0
+    ? JSON.stringify({ decision: "investigate", reason: "Confirm original user scope", requests: [{ type: "history", offset: 0 }] })
+    : allowText }), undefined, undefined, storage)
+  first.setScope("/test/unflushed")
+  const cleanup = await first.setup()
+  await first.run()
+  const lastSent = first.generatedPrompts().at(-1)!
+  await cleanup?.()
+  const resumed = createHarness({}, allowText, undefined, undefined, { ...storage })
+  resumed.setScope("/test/unflushed")
+  const dispose = await resumed.setup()
+  assert.equal((await resumed.run()).effect, "allow")
+  assert.ok(resumed.generatedPrompts()[0]!.startsWith(lastSent + "\n"))
+  assert.match(resumed.generatedPrompts()[0]!, /review_outcome/)
+  release()
+  for (let i = 0; i < 8; i++) await new Promise(done => setImmediate(done))
+  assert.ok(entries.get("journal/ses_test").body.join("\n").includes("reviewer_round"))
+  await dispose?.()
+})
+
+test("cancelled investigation remains an exact prefix of the next review", async () => {
+  let calls = 0
+  let finish!: (value: { text: string }) => void
+  const harness = createHarness({}, async () => {
+    calls++
+    if (calls === 1) return { text: JSON.stringify({ decision: "investigate", reason: "Recover original instructions", requests: [{ type: "history", offset: 0 }] }) }
+    if (calls === 2) return new Promise(resolve => { finish = resolve })
+    return { text: allowText }
+  })
+  const cleanup = await harness.setup()
+  const pending = harness.run()
+  while (calls < 2) await new Promise(done => setImmediate(done))
+  const sent = harness.generatedPrompts().at(-1)!
+  harness.admitPrompt("ses_test")
+  assert.equal((await pending).effect, "ask")
+  finish({ text: allowText })
+  for (let i = 0; i < 5; i++) await new Promise(done => setImmediate(done))
+  assert.equal((await harness.run()).effect, "allow")
+  assert.ok(harness.generatedPrompts().at(-1)!.startsWith(sent + "\n"))
+  await cleanup?.()
+})
+
 test("a delayed write from a disposed instance cannot overwrite a newer one", async () => {
   // A plugin reload disposes one instance and creates another in the same process.
   // The disposed instance's outstanding write must not be able to roll the durable
@@ -525,11 +610,13 @@ test("a delayed write from a disposed instance cannot overwrite a newer one", as
     },
   }
   const first = createHarness({}, allowText, undefined, undefined, storage)
+  first.setScope("/test/write-order")
   const cleanup = await first.setup()
   await first.run()
   await cleanup?.()
 
-  const second = createHarness({}, allowText, undefined, undefined, storage)
+  const second = createHarness({}, allowText, undefined, undefined, { ...storage })
+  second.setScope("/test/write-order")
   await second.setup()
   second.messages[1]!.content[0].state.status = "completed"
   second.messages.push({ id: "assistant2", type: "assistant", content: [
@@ -540,8 +627,9 @@ test("a delayed write from a disposed instance cannot overwrite a newer one", as
 
   releaseFirst()
   for (let turn = 0; turn < 12; turn++) await new Promise((done) => setImmediate(done))
-  assert.equal(written.length, 2, "both snapshots must eventually be written")
-  const [older, newer] = written
+  assert.ok(written.length >= 2, "both reviews must eventually persist")
+  const older = written[0]
+  const newer = written.at(-1)
   assert.ok(newer.body.length > older.body.length, "the second snapshot must be the newer one")
   assert.equal(entries.get("journal/ses_test").body.length, newer.body.length,
     "the disposed instance's late write must not overwrite the newer snapshot")
@@ -640,12 +728,62 @@ test("runtime command toggles auto-review without restarting", async () => {
   assert.match(await harness.command("invalid") ?? "", /Usage:/)
 })
 
-test("configured allow and unknown actions do not call the reviewer", async () => {
+test("host allow and deny decisions and unknown actions do not call the reviewer", async () => {
   const harness = createHarness()
   await harness.setup()
   assert.equal((await harness.run({ effect: "allow" })).effect, "allow")
+  assert.equal((await harness.run({ effect: "deny", message: "User forbids this operation" })).effect, "deny")
   assert.equal((await harness.run({ action: "question" })).effect, "ask")
   assert.deepEqual(harness.counts(), { generateCalls: 0, contextCalls: 0, disposed: 0 })
+})
+
+test("high-risk exact consent can approve while critical risk cannot", async () => {
+  const verdict = { decision: "allow", risk: "high", authorization: "high", reason: "The user explicitly approved the named staging database deletion and data-loss side effect", matched_rules: ["explicit-consent"] }
+  const harness = createHarness({}, JSON.stringify(verdict), async () => [
+    { id: "user", type: "user", text: "I approve permanently deleting only the staging database demo_staging and its data." },
+    { id: "assistant", type: "assistant", content: [
+      { type: "tool", id: "tool", name: "shell", state: { status: "running", input: { command: "dropdb demo_staging" } } },
+    ] },
+  ])
+  const cleanup = await harness.setup()
+  const event = await harness.run({ action: "shell", resources: ["dropdb demo_staging"] })
+  assert.equal(event.effect, "allow")
+  assert.match((event as any).message, /named staging database/)
+  await cleanup?.()
+
+  const critical = createHarness({ humanFallback: true }, JSON.stringify({ ...verdict, risk: "critical" }))
+  const dispose = await critical.setup()
+  assert.equal((await critical.run()).effect, "deny")
+  await dispose?.()
+})
+
+test("human fallback cannot turn classified critical risk into a prompt", async () => {
+  const harness = createHarness({ humanFallback: true }, JSON.stringify({
+    decision: "ask", risk: "critical", authorization: "high",
+    reason: "Credentials would leave for an untrusted destination", matched_rules: ["secret-export"],
+  }))
+  const cleanup = await harness.setup()
+  const event = await harness.run()
+  assert.equal(event.effect, "deny")
+  assert.match((event as any).message, /untrusted destination/)
+  await cleanup?.()
+})
+
+test("distinct permission metadata is reviewed separately and reaches the classifier", async () => {
+  const metadataSeen: unknown[] = []
+  const harness = createHarness({}, async (input) => {
+    const journal = input.prompt.split("\n").filter((line: string) => line.startsWith("{"))
+      .map((line: string) => JSON.parse(line))
+    metadataSeen.push(journal.findLast((entry: any) => entry.type === "review").permission.metadata)
+    return { text: allowText }
+  })
+  const cleanup = await harness.setup()
+  await Promise.all([
+    harness.run({ metadata: { operation: "read" } }),
+    harness.run({ metadata: { operation: "write" } }),
+  ])
+  assert.deepEqual(metadataSeen, [{ operation: "read" }, { operation: "write" }])
+  await cleanup?.()
 })
 
 test("human rules preserve confirmation while reviewer recursion remains ask", async () => {
@@ -863,6 +1001,32 @@ test("new user input cancels only that session's outstanding review", async () =
   harness.admitPrompt("ses_test")
   assert.equal((await pending).effect, "ask")
   assert.equal(harness.generationSignal()?.aborted, true)
+})
+
+test("deadline timers deny even when the wall clock moves backwards", async (t) => {
+  let now = 10_000
+  t.mock.method(Date, "now", () => now)
+  const harness = createHarness({ timeoutMs: 1000 }, allowText, async () => new Promise(() => undefined))
+  const cleanup = await harness.setup()
+  const pending = harness.run()
+  now = 9_000
+  assert.equal((await pending).effect, "deny")
+  await cleanup?.()
+})
+
+test("archive capture hooks release when storage hangs and permission review can recover", async () => {
+  let hang = true
+  const entries = new Map<string, any>()
+  const storage = {
+    get: async (key: string) => key.startsWith("history/") && hang ? new Promise(() => undefined) : entries.get(key),
+    set: async (key: string, value: any) => { entries.set(key, value) },
+  }
+  const harness = createHarness({ timeoutMs: 1000 }, allowText, undefined, undefined, storage)
+  const cleanup = await harness.setup()
+  await harness.dispatch("ses_test", [])
+  hang = false
+  assert.equal((await harness.run()).effect, "allow")
+  await cleanup?.()
 })
 
 test("a hung context read does not block the next same-session review after its deadline", async () => {

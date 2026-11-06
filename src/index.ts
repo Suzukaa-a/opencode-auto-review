@@ -1,18 +1,20 @@
 import { Plugin } from "@opencode/plugin"
 import { createHash } from "node:crypto"
 import { KeyedQueue } from "./keyed-queue.js"
+import { createReviewerTransport } from "./reviewer-transport.js"
 import { captureEvidence } from "./evidence.js"
 import { runReviewLoop, type ReviewOutcome } from "./review-loop.js"
-import { registerModelOptions, type ReviewerModel } from "./model-options.js"
+import { assertReviewerBody, registerModelOptions, type ReviewerModel } from "./model-options.js"
 import { ReviewArchive } from "./review-archive.js"
 import { estimateTokens, inputTokenBudget } from "./context-budget.js"
 import {
+  buildReviewSystemPrompt,
   findHumanReviewReason,
   isEligibleAction,
   parseOptions,
 } from "./policy.js"
 import { buildReviewRequest } from "./review-input.js"
-import { OUTCOME_TAIL, prepareReviewJournal } from "./reviewer-journal.js"
+import { prepareReviewJournal } from "./reviewer-journal.js"
 import { AutoReview } from "./rpc.js"
 import type { PermissionEvent, ReviewerJournalState, ReviewRequest } from "./types.js"
 
@@ -47,37 +49,32 @@ function journalKey(sessionID: string): string {
  * flag, so the total is proportional to sessions with unflushed snapshots, not to
  * the number of reviews.
  */
-const journalPending = new Map<string, Parameters<Plugin.Context["storage"]["set"]>[1]>()
+type JournalWrite = { storage: Plugin.Context["storage"]; sessionID: string; snapshot: ReviewerJournalState }
+const journalPending = new Map<string, JournalWrite>()
 const journalDraining = new Set<string>()
+const latestJournals = new Map<string, { snapshot: ReviewerJournalState; owner: symbol }>()
 
-function publishJournal(storage: Plugin.Context["storage"], sessionID: string, snapshot: ReviewerJournalState): void {
-  // Clone at publish time, so a later mutation cannot change what is queued.
-  journalPending.set(sessionID, JSON.parse(JSON.stringify(snapshot)))
-  void drainJournal(storage, sessionID)
+function publishJournal(key: string, storage: Plugin.Context["storage"], sessionID: string, snapshot: ReviewerJournalState, owner: symbol): void {
+  const copy = structuredClone(snapshot)
+  latestJournals.delete(key)
+  latestJournals.set(key, { snapshot: copy, owner })
+  if (latestJournals.size > 128) latestJournals.delete(latestJournals.keys().next().value!)
+  journalPending.set(key, { storage, sessionID, snapshot: copy })
+  void drainJournal(key)
 }
 
-async function drainJournal(storage: Plugin.Context["storage"], sessionID: string): Promise<void> {
-  if (journalDraining.has(sessionID)) return
-  journalDraining.add(sessionID)
+async function drainJournal(key: string): Promise<void> {
+  if (journalDraining.has(key)) return
+  journalDraining.add(key)
   try {
     for (;;) {
-      const snapshot = journalPending.get(sessionID)
-      if (snapshot === undefined) return
-      // Remove it before writing: a snapshot published while this write is in
-      // flight stays queued and is picked up by the next iteration.
-      journalPending.delete(sessionID)
-      try {
-        await storage.set(journalKey(sessionID), snapshot)
-      } catch {
-        // This one snapshot is dropped. Keep draining rather than returning: a newer
-        // snapshot published while this write was in flight never failed and must
-        // still be attempted. The loop ends by itself once nothing is pending.
-        continue
-      }
+      const write = journalPending.get(key)
+      if (!write) return
+      journalPending.delete(key)
+      try { await write.storage.set(journalKey(write.sessionID), JSON.parse(JSON.stringify(write.snapshot))) }
+      catch { continue }
     }
-  } finally {
-    journalDraining.delete(sessionID)
-  }
+  } finally { journalDraining.delete(key) }
 }
 
 /** How the CLI presents a reviewer notice. */
@@ -87,6 +84,8 @@ export default Plugin.define({
   id: "opencode-auto-review",
   async setup(ctx) {
     const options = parseOptions(ctx.options)
+    const scope = JSON.stringify([ctx.location.directory, ctx.location.workspaceID ?? null])
+    const transport = await createReviewerTransport(ctx.session, buildReviewSystemPrompt(options.maxReviewTokens), ctx.storage, scope)
     let enabled = options.enabled
     let humanFallback = options.humanFallback
     let model: ReviewerModel | undefined
@@ -312,9 +311,18 @@ export default Plugin.define({
       if (kept.length !== messages.length) event.messages = kept
     }
 
+    async function captureArchive(sessionID: string): Promise<void> {
+      const signal = AbortSignal.any([modelController.signal, AbortSignal.timeout(options.timeoutMs)])
+      try {
+        await raceWithAbort(archive.load(sessionID, signal), signal)
+      } catch (error) {
+        diagnose({ action: "archive_capture", sessionID, outcome: "failed", reason: describeError(error) })
+      }
+    }
+
     const contextRegistration = await ctx.session.hook("context", async (event) => {
       if (disposed) return
-      await archive.load(event.sessionID, modelController.signal)
+      await captureArchive(event.sessionID)
       dropNoticeBodies(event)
     })
 
@@ -322,7 +330,7 @@ export default Plugin.define({
     // capture the same originals there to keep authorization completeness intact.
     const compactionRegistration = await ctx.session.hook("compaction", async (event) => {
       if (disposed) return
-      await archive.load(event.sessionID, modelController.signal)
+      await captureArchive(event.sessionID)
       dropNoticeBodies(event)
     })
 
@@ -345,7 +353,8 @@ export default Plugin.define({
 
       const controller = new AbortController()
       const deadline = Date.now() + options.timeoutMs
-      const timer = setTimeout(() => controller.abort(), options.timeoutMs)
+      let timedOut = false
+      const timer = setTimeout(() => { timedOut = true; controller.abort() }, options.timeoutMs)
       activeControllers.set(controller, event.sessionID)
       const key = requestIdentity(event as PermissionEvent)
       try {
@@ -376,7 +385,6 @@ export default Plugin.define({
       } catch {
         if (!disposed) {
           const aborted = controller.signal.aborted
-          const timedOut = aborted && Date.now() >= deadline
           if (aborted && !timedOut) {
             // Cancellation is not a verdict. A new user turn or a disabled plugin
             // must leave the event exactly as the host decided it; concluding here
@@ -446,6 +454,8 @@ export default Plugin.define({
           message: `Automatic review could not resolve a reviewer model: reviewer variant "${selectedModel.variant}" is not available for ${selectedModel.providerID}/${selectedModel.id}`,
           notices }
       }
+      assertReviewerBody(info.body)
+      assertReviewerBody(variant?.body)
       const maxInputTokens = inputTokenBudget(info.limit, { ...info.body, ...variant?.body })
       if (!maxInputTokens) return { code: "context_limit", message: "Reviewer model has no usable input budget after reserving output tokens", notices }
       // The in-memory map is authoritative for this instance. Storage is the
@@ -455,11 +465,13 @@ export default Plugin.define({
       // worth reading. Both waits race the review signal: a storage operation that
       // never settles must not hold this session's queue open, or one stalled read
       // would wedge every later review in the session.
-      let current: ReviewerJournalState | undefined = reviewerStates.get(sessionID)
+      const memoryKey = JSON.stringify([scope, sessionID])
+      const owner = Symbol("review journal")
+      let current: ReviewerJournalState | undefined = latestJournals.get(memoryKey)?.snapshot ?? reviewerStates.get(sessionID)
       if (!current) {
         const restored = await raceWithAbort(ctx.storage.get(journalKey(sessionID)), signal)
           .catch(() => undefined) as ReviewerJournalState | undefined
-        current = reviewerStates.get(sessionID) ?? restored
+        current = latestJournals.get(memoryKey)?.snapshot ?? reviewerStates.get(sessionID) ?? restored
       }
       const prepared = prepareReviewJournal(
         current,
@@ -478,18 +490,14 @@ export default Plugin.define({
         maxInputTokens,
         signal,
         deadline,
-        generate: (prompt) => generateText(prompt, selectedModel, signal),
+        generate: (prompt) => generateText(sessionID, prompt, selectedModel, signal),
+        onJournal: (sent) => publishJournal(memoryKey, ctx.storage, sessionID, { ...state, body: [...sent] }, owner),
         onRound: (round, outcome) => diagnose({ sessionID, round: String(round), outcome }),
       })
-      if (!signal.aborted) {
-        // Persist the snapshot plus a compact verdict tail only. Loop lines
-        // (evidence, reviewer rounds, the full outcome) are per-review; storing
-        // them would move the cached prefix on every review, which is exactly what
-        // the sealed body exists to prevent.
-        const verdict = JSON.stringify(outcome.decision
-          ? { type: "review_outcome", code: outcome.code, decision: outcome.decision }
-          : { type: "review_outcome", code: outcome.code })
-        const saved = { ...state, outcomes: [...state.outcomes, verdict].slice(-OUTCOME_TAIL) }
+      if (latestJournals.get(memoryKey)?.owner === owner) {
+        // Keep every sent line plus the investigation and outcome in place. The
+        // next review extends this exact prefix instead of rebuilding its tail.
+        const saved = { ...state, body: outcome.lines }
         reviewerStates.delete(sessionID)
         reviewerStates.set(sessionID, saved)
         // Bound retained session state. Evicted sessions restore from storage when
@@ -498,22 +506,20 @@ export default Plugin.define({
         // Best-effort: the in-memory map above is authoritative for this instance,
         // so persistence is off the review path. Awaiting it would let a slow or
         // hung storage turn a valid approval into a deadline timeout.
-        publishJournal(ctx.storage, sessionID, saved)
+        publishJournal(memoryKey, ctx.storage, sessionID, saved, owner)
       }
       return notices.length ? { ...outcome, notices } : outcome
     }
 
     async function generateText(
+      sessionID: string,
       prompt: string,
       selectedModel: ReviewerModel,
       signal: AbortSignal,
     ): Promise<{ text?: string; timedOut: boolean; error?: string }> {
       try {
-        const result = await raceWithAbort(ctx.generate.text(
-          { prompt, model: selectedModel },
-          { signal },
-        ), signal)
-        return { text: result.text, timedOut: false }
+        const text = await transport.generate(sessionID, selectedModel, prompt, signal)
+        return { text, timedOut: false }
       } catch (error) {
         return { timedOut: signal.aborted, error: describeError(error) }
       }
@@ -575,7 +581,7 @@ export default Plugin.define({
         const request = buildReviewRequest(messages, event)
         if (request) {
           return { request, evidence: captureEvidence(messages, event, {
-            result: (messageID, toolID) => archive.result(event.sessionID, messageID, toolID),
+            result: (messageID, toolID) => archive.result(event.sessionID, messageID, toolID, signal),
           }) }
         }
         if (attempt < 3) await delay(25 * 2 ** attempt, signal)
@@ -618,6 +624,7 @@ export default Plugin.define({
       reviewerStates.clear()
       noticeOrigins.clear()
       notified.clear()
+      await transport.dispose()
       await registration.dispose()
       await commandRegistration.dispose()
       await promptRegistration.dispose()
@@ -697,6 +704,7 @@ function requestIdentity(event: PermissionEvent): string {
     event.source?.id,
     event.action,
     event.resources,
+    event.metadata,
   ])).digest("hex")
 }
 

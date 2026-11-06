@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path"
 import { spawnSync } from "node:child_process"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
+const executable = process.env.AUTO_REVIEW_CLI ?? "opencode2"
 const marker = "AUTO_REVIEW_LIVE_7F3A91"
 const tempRoot = join(tmpdir(), "opencode")
 mkdirSync(tempRoot, { recursive: true })
@@ -56,7 +57,7 @@ function project(name: string, plugin: "none" | "review" | "human"): string {
 }
 
 function run(directory: string) {
-  const result = spawnSync("opencode2", [
+  const result = spawnSync(executable, [
     "run",
     "--standalone",
     "--model", model,

@@ -23,14 +23,31 @@ test("a bare allow is never upgraded to a fabricated risk/authorization assessme
 
 test("rejects contradictory allows as protocol errors", () => {
   for (const patch of [
-    { risk: "high" },
-    { risk: "critical" },
+    { risk: "high", authorization: "medium" },
     { risk: "unknown" },
     { authorization: "low" },
     { authorization: "unknown" },
   ]) {
     assert.equal(parseReviewResponse(JSON.stringify({ ...valid, ...patch })), undefined)
   }
+})
+
+test("high-risk approval requires exact authorization and an explicit rationale", () => {
+  const approved = { ...valid, risk: "high", authorization: "high", reason: "The user explicitly approved deleting the named staging database after seeing the data-loss risk" }
+  assert.deepEqual(parseReviewResponse(JSON.stringify(approved)), approved)
+  const { reason: _reason, ...withoutReason } = approved
+  assert.equal(parseReviewResponse(JSON.stringify(withoutReason)), undefined)
+  assert.deepEqual(parseReviewResponse(JSON.stringify({ ...approved, risk: "critical" })), { ...approved, risk: "critical", decision: "deny" })
+})
+
+test("critical risk always becomes a denial rather than a confirmation", () => {
+  const pending = { ...valid, decision: "ask", risk: "critical", reason: "Credentials would leave for an untrusted destination" }
+  assert.deepEqual(parseReviewResponse(JSON.stringify(pending)), { ...pending, decision: "deny" })
+})
+
+test("confirmation preserves the known risk and authorization", () => {
+  const pending = { ...valid, decision: "ask", risk: "high", authorization: "medium", reason: "Confirm deletion of the named database" }
+  assert.deepEqual(parseReviewResponse(JSON.stringify(pending)), pending)
 })
 
 test("rejects malformed or expanded responses", () => {

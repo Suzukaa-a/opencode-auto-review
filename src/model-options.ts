@@ -18,7 +18,15 @@ export function parseModelOptions(value: unknown): ModelOptions | undefined {
     Object.values(value).some((entry) => !object(entry))) {
     throw new TypeError("modelOptions must contain settings/body objects")
   }
+  assertReviewerBody(value.body as Record<string, unknown> | undefined)
   return value as ModelOptions
+}
+
+/** Raw provider overlays must not replace the isolated request framing. */
+export function assertReviewerBody(body: Record<string, unknown> | undefined): void {
+  const structural = ["input", "messages", "system", "instructions", "tools", "tool_choice", "previous_response_id", "conversation", "contents", "systemInstruction", "system_instruction", "model"]
+  const key = structural.find((key) => body && Object.hasOwn(body, key))
+  if (key) throw new TypeError(`Reviewer request body cannot override ${key}`)
 }
 
 /** Add a reviewer-only variant; never alter the base model or an existing variant. */

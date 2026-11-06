@@ -34,12 +34,15 @@ export function parseReviewResponse(text: string): ReviewDecision | undefined {
   if (!Array.isArray(value.matched_rules) || value.matched_rules.length > MAX_RULES) return
   if (value.matched_rules.some((rule) => typeof rule !== "string" || rule === "" || Buffer.byteLength(rule, "utf8") > MAX_RULE_BYTES)) return
 
-  const inconsistentAllow = value.decision === "allow" &&
-    (!["low", "medium"].includes(value.risk as string) || !["high", "medium"].includes(value.authorization as string))
+  const authorizedRisk = ["low", "medium"].includes(value.risk as string)
+    ? ["high", "medium"].includes(value.authorization as string)
+    : value.risk === "high" && value.authorization === "high"
+  const inconsistentAllow = value.decision === "allow" && value.risk !== "critical" && !authorizedRisk
   if (inconsistentAllow) return
-  const decision = value.decision as ReviewDecision["decision"]
+  // A classified critical action is terminal even when the reviewer requests a prompt.
+  const decision = (value.risk === "critical" ? "deny" : value.decision) as ReviewDecision["decision"]
   const reason = value.reason
-  if ((decision !== "allow" || (decision === "allow" && value.authorization === "medium")) &&
+  if ((decision !== "allow" || value.authorization === "medium" || value.risk === "high") &&
     typeof reason !== "string") return
 
   return {

@@ -19,6 +19,9 @@ function harness(options: { enabled?: boolean; failSwitch?: boolean } = {}) {
   const statusCalls: Array<{ input: unknown; options: any }> = []
   const toasts: any[] = []
   const connectedHandlers: Array<() => void> = []
+  const createdHandlers: Array<(event: any) => void> = []
+  const sessions = new Map<string, any>()
+  const archived: string[] = []
   const eventHandlers = new Map<string, (event: any) => void>()
   let selectReplies: string[] = []
   const commands: any[] = []
@@ -44,8 +47,17 @@ function harness(options: { enabled?: boolean; failSwitch?: boolean } = {}) {
   const context: any = {
     options: {},
     location: { directory: "/repo", workspaceID: "ws" },
-    client: { rpc: () => client },
-    data: { on: (_name: string, handler: () => void) => { connectedHandlers.push(handler); return () => undefined } },
+    client: { rpc: () => client, session: {
+      get: async ({ sessionID }: any) => sessions.get(sessionID),
+      update: async ({ sessionID, archived: value }: any) => {
+        if (value) { sessions.get(sessionID).time.archived = 1; archived.push(sessionID) }
+      },
+    } },
+    data: { session: { list: () => [...sessions.values()] }, on: (name: string, handler: any) => {
+      if (name === "server.connected") connectedHandlers.push(handler)
+      if (name === "session.created") createdHandlers.push(handler)
+      return () => undefined
+    } },
     ui: {
       toast: { show: (toast: any) => toasts.push(toast) },
       slot: (claim: any) => { slotClaim = claim; return () => undefined },
@@ -53,10 +65,11 @@ function harness(options: { enabled?: boolean; failSwitch?: boolean } = {}) {
       dialog: { select: async () => selectReplies.shift() },
     },
     keymap: { layer: (callback: () => any) => { commands.push(...callback().commands); return () => undefined } },
-    theme: { text: { action: { primary: { default: "#fff" } } } },
+    theme: { text: { action: { primary: { base: "#fff" } } } },
   }
   return {
-    context, toasts, statusCalls, commands,
+    context, toasts, statusCalls, commands, sessions, archived,
+    created: (sessionID: string, location = context.location) => createdHandlers.forEach(handler => handler({ data: { sessionID }, location })),
     setReply: (value: string | undefined) => { if (value !== undefined) selectReplies.push(value) },
     setFailStatus: (value: boolean) => { failStatus = value },
     serverState: () => enabled,
@@ -75,6 +88,25 @@ function harness(options: { enabled?: boolean; failSwitch?: boolean } = {}) {
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
+
+test("the authenticated client archives only marked reviewer sessions", async () => {
+  const h = harness()
+  h.sessions.set("old-review", { id: "old-review", metadata: { "opencode-auto-review": true }, time: {} })
+  h.sessions.set("main", { id: "main", metadata: {}, time: {} })
+  const cleanup = await tui.setup(h.context)
+  await tick()
+  assert.deepEqual(h.archived, ["old-review"])
+  h.sessions.set("new-review", { id: "new-review", metadata: { "opencode-auto-review": true }, time: {} })
+  h.created("new-review")
+  h.created("main")
+  await tick()
+  assert.deepEqual(h.archived, ["old-review", "new-review"])
+  h.sessions.set("other", { id: "other", metadata: { "opencode-auto-review": true }, time: {} })
+  h.created("other", { directory: "/other", workspaceID: "ws" })
+  await tick()
+  assert.deepEqual(h.archived, ["old-review", "new-review"])
+  await cleanup?.()
+})
 
 test("the footer command shows the RPC-confirmed state and reflects a real switch", async () => {
   const h = harness({ enabled: true })

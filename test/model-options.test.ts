@@ -36,6 +36,9 @@ test("no request body is written by default; an explicit body passes through unc
   assert.deepEqual(parseOptions({ maxReviewTokens: 1024 }).modelOptions, undefined)
   assert.deepEqual(parseOptions({ modelOptions: { settings: { reasoningEffort: "low" } } }).modelOptions,
     { settings: { reasoningEffort: "low" } })
+  for (const key of ["input", "messages", "system", "instructions", "tools", "tool_choice", "previous_response_id", "conversation"]) {
+    assert.throws(() => parseOptions({ modelOptions: { body: { [key]: "override" } } }), /cannot override/)
+  }
   for (const body of [{ max_output_tokens: 512 }, { max_completion_tokens: 512 }, {}]) {
     assert.deepEqual(parseOptions({ modelOptions: { body } }).modelOptions?.body, body)
   }

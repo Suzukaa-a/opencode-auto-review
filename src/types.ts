@@ -1,25 +1,27 @@
+import type { PermissionEvaluation } from "@opencode/plugin/promise/permission"
+
 export interface PermissionSource {
   type: "tool"
   messageID: string
   id: string
 }
 
-export interface PermissionEvent {
+/** Keep the SDK contract while accepting decoded session/tool identifiers in archived data. */
+export interface PermissionEvent extends Pick<PermissionEvaluation, "action" | "resources" | "metadata" | "effect" | "message"> {
   readonly sessionID: string
   readonly agent?: string
-  readonly action: string
-  readonly resources: readonly string[]
   readonly source?: PermissionSource
-  effect: "allow" | "ask" | "deny"
-  message?: string
 }
 
 export interface ReviewRequest {
   checkpoint?: string
   context: ReviewContextEntry[]
+  /** Stable host identities aligned with context; detects rollback to identical text. */
+  sourceIDs?: string[]
   permission: {
     action: string
     resources: readonly string[]
+    metadata?: Record<string, unknown>
   }
 }
 
@@ -36,25 +38,12 @@ export interface ReviewDecision {
   matched_rules: string[]
 }
 
-/**
- * Persisted reviewer journal. `body` is the cached prompt prefix for the current
- * compaction epoch; `sourceLength`/`sourceDigest` mark the snapshot boundary it
- * was selected from. Per-review lines (the pending tool, the evidence index, and
- * loop lines) are derived and never stored.
- */
+/** Complete reviewer journal, retained in sent order within an epoch. */
 export interface ReviewerJournalState {
   checkpoint?: string
-  version: 5
+  version: 6
   epoch: number
   sourceLength: number
   sourceDigest: string
   body: string[]
-  /**
-   * True once the body has stopped growing. Persisted so the seal survives a
-   * reload: without it, a later small request could fall back into the growing
-   * phase and restart the churn this state exists to prevent.
-   */
-  sealed: boolean
-  /** Compact prior verdicts for this epoch, newest last. */
-  outcomes: string[]
 }

@@ -1,8 +1,8 @@
 # OpenCode Auto Review
 
-Automatically reviews **OpenCode V2** permission prompts for long-running unattended work. Authorized operations with low or medium bounded risk proceed automatically; everything else is denied with a reason the coding model can act on.
+Automatically reviews **OpenCode V2** permission prompts for unattended work. Routine authorized work proceeds automatically. High-risk operations need explicit consent covering the exact target and side effects; critical-risk operations are denied.
 
-Requires OpenCode 2.0.4 or newer, which is the release that exposes the `ctx.model` plugin context this plugin uses. An older host cannot provide that context shape.
+Targets **OpenCode V2 2.2.5**, the stable release verified on November 5, 2026. Upgrade the host together with the plugin.
 
 ## Install
 
@@ -28,19 +28,19 @@ Choose a reviewer model in `opencode.json(c)`. Replace the example with an avail
 }
 ```
 
-The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default. Notices are CLI toasts, so nothing is ever written to the session and an idle session is never resumed. Notices never change the permission decision.
+The model is optional: the plugin falls back to the `auto-reviewer` agent's model, then OpenCode's default. Notices are CLI toasts, so nothing is ever written to the session and an idle session is never resumed. Notices never change the permission decision. Reviews use separate sessions titled `[Auto-review] …`; their requests and replies do not enter your conversation. The connected TUI archives these sessions automatically. Resuming the same coding session reuses its reviewer session and saved review journal; compaction rebuilds only the journal, keeping the fixed system policy.
 
-Automatic review is enabled by default, with a **2,048-token prompt-side output budget** and **90 seconds total per request**. Change these with `maxReviewTokens` and `timeoutMs`. The plugin sets no provider request cap by default, because the correct field is protocol-specific and a wrong guess is silently ignored; see [advanced configuration](DESIGN.md#configuration) for naming the field for your API and for human-only rules.
+Automatic review is enabled by default, with a **90-second deadline per request**. Use `humanReviewRules` for operations that must always ask you, and `humanFallback: true` to ask when automatic review cannot approve. See [configuration](DESIGN.md#configuration) for the available options and provider output limits.
 
 ## Usage
 
 `/auto-review [on|off|toggle|status]`, or the palette's **Toggle Auto-review**. The TUI reads and changes this state over the plugin RPC contract instead of parsing session text; the slash command keeps its explicit status output.
 
-The plugin handles eligible requests that would otherwise ask for permission. It reviews each request against the task the main conversation is actually working on: your instructions are kept across a compaction, while the tool history before it is dropped so the reviewer carries no backlog the coding model has already shed. Recent actions are kept so a once-only instruction is not replayed, and an earlier tool result can still be retrieved by ID when a decision depends on it. For a boundary that must hold no matter what, use `humanReviewRules` or your own host `deny`/`ask` rules. Its feedback is limited to permission and safety decisions.
+The plugin handles eligible requests that would otherwise ask for permission. It reviews each request against the task the main conversation is actually working on: your instructions are kept across a compaction, while the tool history before it is dropped so the reviewer carries no backlog the coding model has already shed. Recent actions are kept so a once-only instruction is not replayed, and an earlier tool result can still be retrieved by ID when a decision depends on it. Use `humanReviewRules` for mandatory confirmation and host `deny` rules for prohibited operations. Host `ask` rules are eligible for automatic review. Its feedback is limited to permission and safety decisions.
 
 The reviewer reads your instructions, so treat the reviewer model as part of the session's trust boundary: pick one you would trust with the session's user text, especially when it is a different provider from the coding model.
 
-By default the plugin never waits for a human: a request the reviewer cannot approve becomes a **denial** whose reason tells the model what was missing, so unattended runs cannot stall. Use `/auto-review fallback on` to prompt instead. An explicit `humanReviewRules` entry always prompts.
+By default, a request the reviewer cannot approve becomes a **denial** with a reason the coding model can act on. Use `/auto-review fallback on` to prompt instead. An explicit `humanReviewRules` entry always prompts.
 
 ## Development
 

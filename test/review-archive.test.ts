@@ -7,12 +7,126 @@ import { prepareReviewJournal } from "../src/reviewer-journal.js"
 import type { PermissionEvent } from "../src/types.js"
 import { estimateTokens } from "../src/context-budget.js"
 
+function gate() {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => { resolve = done })
+  return { promise, resolve }
+}
+
 function fixture() {
   const values = new Map<string, any>()
   let context: unknown[] = []
   const storage: any = { get: async (key: string) => structuredClone(values.get(key)), set: async (key: string, value: any) => { values.set(key, structuredClone(value)) } }
   return { values, set: (messages: unknown[]) => { context = messages }, create: () => new ReviewArchive(storage, async () => structuredClone(context)) }
 }
+for (const blocked of ["context", "storage read"] as const) {
+  test("cancelling a hung " + blocked + " releases the archive queue", { timeout: 2_000 }, async () => {
+    const entered = gate()
+    const blockedOperation = gate()
+    const values = new Map<string, any>()
+    let hang = true
+    let messages: unknown[] = [user("old", "Old instruction")]
+    const pause = async () => {
+      if (!hang) return
+      hang = false
+      entered.resolve()
+      await blockedOperation.promise
+    }
+    const storage: any = {
+      get: async (key: string) => {
+        if (blocked === "storage read") await pause()
+        return structuredClone(values.get(key))
+      },
+      set: async (key: string, value: any) => { values.set(key, structuredClone(value)) },
+    }
+    const archive = new ReviewArchive(storage, async () => {
+      const snapshot = structuredClone(messages)
+      if (blocked === "context") await pause()
+      return snapshot
+    })
+    const controller = new AbortController()
+    const first = archive.load("s", controller.signal)
+    const cancelled = assert.rejects(first, { name: "AbortError" })
+    await entered.promise
+    controller.abort()
+    await cancelled
+    messages = [user("new", "New restriction")]
+    const second = await archive.load("s", signal)
+    assert.deepEqual(second.messages, messages)
+    blockedOperation.resolve()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.deepEqual(values.get("history/s").messages, messages, "the late read must not resume the cancelled load and overwrite the new snapshot")
+  })
+}
+
+for (const blocked of ["history/s", "result/s/original/tool-original"]) {
+  test("cancelling a hung write to " + blocked + " preserves storage order", { timeout: 2_000 }, async () => {
+    const entered = gate()
+    const blockedOperation = gate()
+    const persisted = gate()
+    const values = new Map<string, any>()
+    let hang = true
+    let messages: unknown[] = [user("root", "Inspect only"), tool("original", "old evidence")]
+    const storage: any = {
+      get: async (key: string) => structuredClone(values.get(key)),
+      set: async (key: string, value: any) => {
+        const delayed = key === blocked && hang
+        if (delayed) {
+          hang = false
+          entered.resolve()
+          await blockedOperation.promise
+        }
+        values.set(key, structuredClone(value))
+        if (delayed) persisted.resolve()
+      },
+    }
+    const create = () => new ReviewArchive(storage, async () => structuredClone(messages))
+    const archive = create()
+    const controller = new AbortController()
+    const first = archive.load("s", controller.signal)
+    const cancelled = assert.rejects(first, { name: "AbortError" })
+    await entered.promise
+    controller.abort()
+    await cancelled
+    messages = [user("replacement", "Do not publish"), tool("original", "new evidence")]
+    // These settle while the old write is still blocked. A replacement instance
+    // must also refuse to read stale history or race the unfinished write.
+    await assert.rejects(archive.load("s", signal), /archive write is still pending/)
+    const replacement = create()
+    await assert.rejects(replacement.load("s", signal), /archive write is still pending/)
+    assert.deepEqual((await replacement.load("other", signal)).messages.map((entry: any) => entry.id), ["replacement", "original"])
+    blockedOperation.resolve()
+    await persisted.promise
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const loaded = await replacement.load("s", signal)
+    assert.match(JSON.stringify(loaded.messages), /Do not publish/)
+    assert.doesNotMatch(JSON.stringify(values.get("history/s")), /Inspect only/)
+    assert.match(await replacement.result("s", "original", "tool-original") ?? "", /new evidence/)
+    assert.match(JSON.stringify((await create().load("s", signal)).messages), /Do not publish/)
+  })
+}
+
+test("a hung tool-result read can be cancelled and retried", { timeout: 2_000 }, async () => {
+  const entered = gate()
+  let hang = true
+  const archive = new ReviewArchive({
+    get: async () => {
+      if (!hang) return "original evidence"
+      entered.resolve()
+      return new Promise<never>(() => undefined)
+    },
+    set: async () => undefined,
+  } as any, async () => [])
+  const controller = new AbortController()
+  const reading = archive.result("s", "message", "tool", controller.signal)
+  const cancelled = assert.rejects(reading, { name: "AbortError" })
+  await entered.promise
+  controller.abort()
+  await cancelled
+  hang = false
+  assert.equal(await archive.result("s", "message", "tool", signal), "original evidence")
+})
+
 const signal = new AbortController().signal
 const user = (id: string, text: string) => ({ id, type: "user", text })
 const tool = (id: string, text?: string) => ({ id, type: "assistant", content: [{ type: "tool", id: `tool-${id}`, name: "read", state: {

@@ -12,7 +12,7 @@ export function captureEvidence(messages: readonly unknown[], event: PermissionE
   const history: unknown[] = []
   const results = new Map<string, string>()
   const tools: { messageID: string; toolID: string; name: string }[] = []
-  for (const message of messages.slice(0, Math.max(0, end))) {
+  for (const message of messages.slice(0, Math.max(0, end + 1))) {
     if (!record(message)) continue
     if (message.type === "user" && typeof message.text === "string" && message.text.trim()) {
       history.push({ type: "user", text: message.text })
@@ -20,6 +20,8 @@ export function captureEvidence(messages: readonly unknown[], event: PermissionE
     if (message.type !== "assistant" || typeof message.id !== "string" || !Array.isArray(message.content)) continue
     for (const part of message.content) {
       if (!record(part) || part.type !== "tool" || typeof part.id !== "string" || typeof part.name !== "string" || !record(part.state)) continue
+      if (message.id === event.source?.messageID && (part.id === event.source.id ||
+        !["completed", "error"].includes(part.state.status as string))) continue
       const ref = { messageID: message.id, toolID: part.id, name: part.name }
       history.push({ type: "tool", ...ref, input: part.state.input })
       if (part.state.status !== "completed" && part.state.status !== "error") continue

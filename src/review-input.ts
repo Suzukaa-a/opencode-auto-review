@@ -38,14 +38,16 @@ export function buildReviewRequest(
   const currentTool = tool
 
   const history: ReviewContextEntry[] = []
+  const sourceIDs: string[] = []
   let hasUser = false
   let checkpoint: string | undefined
-  for (let index = 0; index < sourceIndex; index++) {
+  for (let index = 0; index <= sourceIndex; index++) {
     const message = window[index]
     if (!isRecord(message)) continue
     if (message.type === "compaction" && message.status === "completed" &&
       typeof message.summary === "string" && typeof message.recent === "string") {
       history.push({ type: "compaction", summary: message.summary, recent: message.recent })
+      sourceIDs.push(JSON.stringify([message.id, "compaction"]))
       // Only an anchor the reviewer can actually see: a compaction whose summary
       // line was not included must not key the journal epoch.
       if (typeof message.id === "string") checkpoint = message.id
@@ -54,12 +56,19 @@ export function buildReviewRequest(
     if (message.type === "user" && typeof message.text === "string" && message.text.trim()) {
       hasUser = true
       history.push({ type: "user", text: message.text })
+      sourceIDs.push(JSON.stringify([message.id, "user"]))
       continue
     }
     if (message.type !== "assistant" || !Array.isArray(message.content)) continue
     for (const part of message.content) {
+      // Completed siblings consumed authorization even within the current model turn.
+      if (index === sourceIndex && (!isRecord(part) || part.id === event.source.id ||
+        !isRecord(part.state) || !["completed", "error"].includes(part.state.status as string))) continue
       const historicalTool = readCompleteToolPart(part)
-      if (historicalTool) history.push({ type: "tool", ...historicalTool })
+      if (historicalTool) {
+        history.push({ type: "tool", ...historicalTool })
+        sourceIDs.push(JSON.stringify([message.id, isRecord(part) ? part.id : undefined]))
+      }
     }
   }
   // A permission decision must rest on at least one user instruction. A summary
@@ -68,8 +77,13 @@ export function buildReviewRequest(
 
   return {
     ...(checkpoint ? { checkpoint } : {}),
+    sourceIDs: [...sourceIDs, JSON.stringify([event.source.messageID, event.source.id])],
     context: structuredClone([...history, { type: "tool" as const, name: currentTool.name, input: currentTool.input }]),
-    permission: { action: event.action, resources: [...event.resources] },
+    permission: {
+      action: event.action,
+      resources: [...event.resources],
+      ...(event.metadata ? { metadata: structuredClone(event.metadata) } : {}),
+    },
   }
 
 }
