@@ -11,11 +11,11 @@
   "author": "Suzukaaa",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/o00nmq/opencode-auto-review.git"
+    "url": "git+https://github.com/Suzukaa-a/opencode-auto-review.git"
   },
-  "homepage": "https://github.com/o00nmq/opencode-auto-review#readme",
+  "homepage": "https://github.com/Suzukaa-a/opencode-auto-review#readme",
   "bugs": {
-    "url": "https://github.com/o00nmq/opencode-auto-review/issues"
+    "url": "https://github.com/Suzukaa-a/opencode-auto-review/issues"
   },
   "type": "module",
   "exports": {
